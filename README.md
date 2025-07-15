@@ -1,4 +1,4 @@
-# wasm_bucket
+# wasm-bucket
 
 **wasm_bucket** is a lightweight collection of standalone Rust-based WebAssembly modules.  
 Each folder contains a self-contained `.rs` file compiled directly into a `.wasm` file.
