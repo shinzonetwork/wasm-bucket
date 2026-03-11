@@ -77,49 +77,48 @@ fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {
         EndOfStream => return Ok(EndOfStream),
     };
 
-    let tx_hash = str_field(&doc, "transactionHash");
-    let block_number = doc
-        .get("blockNumber")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_default()
-        .to_string();
+    let input_data = match doc.get("inputData").and_then(|v| v.as_str()) {
+        std::option::Option::Some(d) if d.len() >= 10 => d.to_string(),
+        _ => return ok_json(&doc),
+    };
 
-    let topics = parse_topics(&doc)?;
-    if topics.is_empty() {
-        return ok_json(&doc);
-    }
+    let selector = &input_data[..10];
+    let functions = parse_abi()?;
 
-    let abi = parse_abi()?;
+    doc.insert("hash".into(), Value::String(str_field(&doc, "hash")));
+    doc.insert("block".into(), Value::String(
+        doc.get("blockNumber")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default()
+            .to_string(),
+    ));
 
-    doc.insert("hash".into(), Value::String(tx_hash.clone()));
-    doc.insert("block".into(), Value::String(block_number.clone()));
-
-    if let std::option::Option::Some(event) = find_matching_event(&abi, &topics[0]) {
-        decode_event(&mut doc, &event, &topics)?;
+    if let std::option::Option::Some(func) = find_matching_function(&functions, selector) {
+        decode_function(&mut doc, &func, &input_data)?;
     }
 
     ok_json(&doc)
 }
 
-struct AbiEvent {
+struct AbiFunction {
     name: String,
     signature: String,
+    selector: String,
     inputs: Vec<AbiInput>,
 }
 
 struct AbiInput {
     name: String,
     typ: String,
-    indexed: bool,
 }
 
-fn parse_abi() -> Result<Vec<AbiEvent>, Box<dyn error::Error>> {
+fn parse_abi() -> Result<Vec<AbiFunction>, Box<dyn error::Error>> {
     let params = get_params()?;
     let items: Vec<Value> = serde_json::from_str(&params.abi)?;
 
-    let events = items
+    let functions = items
         .iter()
-        .filter(|item| item["type"] == "event")
+        .filter(|item| item["type"] == "function")
         .filter_map(|item| {
             let name = item["name"].as_str()?;
             let inputs = item["inputs"].as_array()?;
@@ -130,7 +129,6 @@ fn parse_abi() -> Result<Vec<AbiEvent>, Box<dyn error::Error>> {
                     std::option::Option::Some(AbiInput {
                         name: inp["name"].as_str()?.to_string(),
                         typ: inp["type"].as_str()?.to_string(),
-                        indexed: inp["indexed"].as_bool().unwrap_or(false),
                     })
                 })
                 .collect();
@@ -138,76 +136,62 @@ fn parse_abi() -> Result<Vec<AbiEvent>, Box<dyn error::Error>> {
             let types: Vec<&str> = abi_inputs.iter().map(|i| i.typ.as_str()).collect();
             let sig = format!("{}({})", name, types.join(","));
 
-            std::option::Option::Some(AbiEvent {
+            let mut hasher = Keccak256::new();
+            hasher.update(sig.as_bytes());
+            let full_hash = hex::encode(hasher.finalize());
+            let selector = format!("0x{}", &full_hash[..8]);
+
+            std::option::Option::Some(AbiFunction {
                 name: name.to_string(),
                 signature: sig,
+                selector,
                 inputs: abi_inputs,
             })
         })
         .collect();
 
-    Ok(events)
+    Ok(functions)
 }
 
-fn find_matching_event<'a>(events: &'a [AbiEvent], topic0: &str) -> std::option::Option<&'a AbiEvent> {
-    events.iter().find(|e| event_selector(&e.signature) == topic0)
+fn find_matching_function<'a>(functions: &'a [AbiFunction], selector: &str) -> std::option::Option<&'a AbiFunction> {
+    let sel_lower = selector.to_lowercase();
+    functions.iter().find(|f| f.selector.to_lowercase() == sel_lower)
 }
 
-fn event_selector(signature: &str) -> String {
-    let mut hasher = Keccak256::new();
-    hasher.update(signature.as_bytes());
-    format!("0x{}", hex::encode(hasher.finalize()))
-}
-
-fn decode_event(
+fn decode_function(
     doc: &mut HashMap<String, Value>,
-    event: &AbiEvent,
-    topics: &[String],
+    func: &AbiFunction,
+    input_data: &str,
 ) -> Result<(), Box<dyn error::Error>> {
-    doc.insert("event".into(), Value::String(event.name.clone()));
-    doc.insert("signature".into(), Value::String(event.signature.clone()));
+    doc.insert("function".into(), Value::String(func.name.clone()));
+    doc.insert("signature".into(), Value::String(func.signature.clone()));
+
+    let calldata_hex = input_data[10..].to_string();
+    let calldata = match hex::decode(&calldata_hex) {
+        Ok(b) => b,
+        Err(_) => {
+            doc.insert("arguments".into(), Value::Array(Vec::new()));
+            return Ok(());
+        }
+    };
 
     let mut arguments = Vec::new();
-    let mut non_indexed = Vec::new();
-    let mut topic_idx = 1;
+    let mut offset = 0;
 
-    for inp in &event.inputs {
-        if inp.indexed {
-            if topic_idx < topics.len() {
-                let value = decode_param(&inp.typ, &topics[topic_idx]);
-                arguments.push(serde_json::json!({
-                    "name": inp.name,
-                    "type": inp.typ,
-                    "value": value,
-                }));
-            }
-            topic_idx += 1;
-        } else {
-            non_indexed.push(inp);
-            topic_idx += 1;
+    for inp in &func.inputs {
+        if offset + 32 > calldata.len() {
+            break;
         }
-    }
+        let raw = &calldata[offset..offset + 32];
+        let hex_val = format!("0x{}", hex::encode(raw));
+        let value = decode_param(&inp.typ, &hex_val);
 
-    if let std::option::Option::Some(data_str) = doc.get("data").and_then(|d| d.as_str()) {
-        let data_hex = data_str.strip_prefix("0x").unwrap_or(data_str);
-        if let Ok(data_bytes) = hex::decode(data_hex) {
-            let mut offset = 0;
-            for inp in &non_indexed {
-                if offset + 32 > data_bytes.len() {
-                    break;
-                }
-                let raw = &data_bytes[offset..offset + 32];
-                let hex_val = format!("0x{}", hex::encode(raw));
-                let value = decode_param(&inp.typ, &hex_val);
-
-                arguments.push(serde_json::json!({
-                    "name": inp.name,
-                    "type": inp.typ,
-                    "value": value,
-                }));
-                offset += 32;
-            }
-        }
+        arguments.push(serde_json::json!({
+            "name": inp.name,
+            "type": inp.typ,
+            "value": value,
+        }));
+        offset += 32;
     }
 
     doc.insert("arguments".into(), Value::Array(arguments));
@@ -217,9 +201,19 @@ fn decode_event(
 fn decode_param(typ: &str, hex_data: &str) -> String {
     let clean = hex_data.trim_start_matches("0x");
     match typ {
-        "uint256" => u128::from_str_radix(clean, 16)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "0".to_string()),
+        "uint256" | "uint128" | "uint64" | "uint32" | "uint16" | "uint8" => {
+            u128::from_str_radix(clean, 16)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| {
+                    // value too large for u128, return as hex
+                    format!("0x{}", clean)
+                })
+        }
+        "int256" | "int128" | "int64" | "int32" | "int16" | "int8" => {
+            i128::from_str_radix(clean, 16)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|_| format!("0x{}", clean))
+        }
         "address" => {
             if clean.len() >= 40 {
                 format!("0x{}", &clean[clean.len() - 40..])
@@ -228,8 +222,8 @@ fn decode_param(typ: &str, hex_data: &str) -> String {
             }
         }
         "bool" => clean.ends_with('1').to_string(),
-        "bytes32" => format!("0x{}", clean),
-        _ => format!("unsupported type: {}", typ),
+        "bytes32" | "bytes20" | "bytes16" | "bytes4" => format!("0x{}", clean),
+        _ => format!("0x{}", clean),
     }
 }
 
@@ -238,17 +232,6 @@ fn str_field(doc: &HashMap<String, Value>, key: &str) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string()
-}
-
-fn parse_topics(doc: &HashMap<String, Value>) -> Result<Vec<String>, Box<dyn error::Error>> {
-    let val = doc.get("topics").ok_or("missing 'topics' field")?;
-    let arr = val
-        .as_array()
-        .ok_or_else(|| format!("'topics' is not an array, got: {:?}", val))?;
-    Ok(arr
-        .iter()
-        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-        .collect())
 }
 
 fn ok_json(doc: &HashMap<String, Value>) -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {

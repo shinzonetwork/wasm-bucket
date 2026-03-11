@@ -63,15 +63,29 @@ fn try_set_param(ptr: *mut u8) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn safe_to_mem(type_id: i8, data: &[u8]) -> *mut u8 {
+    let total = 1 + 4 + data.len();
+    let ptr = lens_sdk::alloc(total);
+    unsafe {
+        *ptr = type_id as u8;
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), ptr.add(1), 4);
+        if !data.is_empty() {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(5), data.len());
+        }
+    }
+    ptr
+}
+
 #[no_mangle]
 pub extern fn transform() -> *mut u8 {
     match try_transform() {
         Ok(o) => match o {
-            Some(result_json) => lens_sdk::to_mem(lens_sdk::JSON_TYPE_ID, &result_json),
+            Some(result_json) => safe_to_mem(lens_sdk::JSON_TYPE_ID, &result_json),
             None => lens_sdk::nil_ptr(),
-            EndOfStream => lens_sdk::to_mem(lens_sdk::EOS_TYPE_ID, &[]),
+            EndOfStream => safe_to_mem(lens_sdk::EOS_TYPE_ID, &[]),
         },
-        Err(e) => lens_sdk::to_mem(lens_sdk::ERROR_TYPE_ID, &e.to_string().as_bytes())
+        Err(e) => safe_to_mem(lens_sdk::ERROR_TYPE_ID, e.to_string().as_bytes())
     }
 }
 
@@ -79,9 +93,7 @@ fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn Error>> {
     let ptr = unsafe { next() };
     let mut input = match lens_sdk::try_from_mem::<HashMap<String, serde_json::Value>>(ptr)? {
         Some(v) => v,
-        // Implementations of `transform` are free to handle nil however they like. In this
-        // implementation we chose to return nil given a nil input.
-        None => return Ok(None),
+        None => return try_transform(),
         EndOfStream => return Ok(EndOfStream)
     };
     
@@ -98,10 +110,6 @@ fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn Error>> {
         return try_transform();
     }
 
-    let result = input.clone();
-
-    let result_json = serde_json::to_vec(&result)?;
-
-    lens_sdk::free_transport_buffer(ptr)?;
+    let result_json = serde_json::to_vec(&input)?;
     Ok(Some(result_json))
 }
