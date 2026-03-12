@@ -73,11 +73,11 @@ fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {
     let ptr = unsafe { next() };
     let mut doc = match lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? {
         Some(v) => v,
-        None => return Ok(None),
+        None => return try_transform(),
         EndOfStream => return Ok(EndOfStream),
     };
 
-    let input_data = match doc.get("inputData").and_then(|v| v.as_str()) {
+    let input_data = match doc.get("input").and_then(|v| v.as_str()) {
         std::option::Option::Some(d) if d.len() >= 10 => d.to_string(),
         _ => return ok_json(&doc),
     };

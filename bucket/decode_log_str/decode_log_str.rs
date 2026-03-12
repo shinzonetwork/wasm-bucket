@@ -59,13 +59,27 @@ fn try_set_param(ptr: *mut u8) -> Result<(), Box<dyn error::Error>> {
     Ok(())
 }
 
+fn safe_to_mem(type_id: i8, data: &[u8]) -> *mut u8 {
+    let total = 1 + 4 + data.len();
+    let ptr = lens_sdk::alloc(total);
+    unsafe {
+        *ptr = type_id as u8;
+        let len_bytes = (data.len() as u32).to_le_bytes();
+        std::ptr::copy_nonoverlapping(len_bytes.as_ptr(), ptr.add(1), 4);
+        if !data.is_empty() {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(5), data.len());
+        }
+    }
+    ptr
+}
+
 #[no_mangle]
 pub extern "C" fn transform() -> *mut u8 {
     match try_transform() {
-        Ok(Some(json)) => lens_sdk::to_mem(lens_sdk::JSON_TYPE_ID, &json),
+        Ok(Some(json)) => safe_to_mem(lens_sdk::JSON_TYPE_ID, &json),
         Ok(None) => lens_sdk::nil_ptr(),
-        Ok(EndOfStream) => lens_sdk::to_mem(lens_sdk::EOS_TYPE_ID, &[]),
-        Err(e) => lens_sdk::to_mem(lens_sdk::ERROR_TYPE_ID, e.to_string().as_bytes()),
+        Ok(EndOfStream) => safe_to_mem(lens_sdk::EOS_TYPE_ID, &[]),
+        Err(e) => safe_to_mem(lens_sdk::ERROR_TYPE_ID, e.to_string().as_bytes()),
     }
 }
 
@@ -73,29 +87,41 @@ fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {
     let ptr = unsafe { next() };
     let mut doc = match lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? {
         Some(v) => v,
-        None => return Ok(None),
+        None => return ok_json(&HashMap::new()),
         EndOfStream => return Ok(EndOfStream),
     };
 
-    let tx_hash = str_field(&doc, "transactionHash");
-    let block_number = doc
-        .get("blockNumber")
-        .and_then(|v| v.as_i64())
-        .unwrap_or_default()
-        .to_string();
+    // Extract tx context from the nested transaction relation
+    let tx = doc.get("transaction").and_then(|v| v.as_object());
+    let tx_hash = tx.map(|t| str_field_map(t, "hash")).unwrap_or_default();
+    let from = tx.map(|t| str_field_map(t, "from")).unwrap_or_default();
+    let to = tx.map(|t| str_field_map(t, "to")).unwrap_or_default();
 
-    let topics = parse_topics(&doc)?;
+    let block_number = doc.get("blockNumber").and_then(|v| v.as_i64()).unwrap_or(0);
+    let log_address = str_field(&doc, "address");
+
+    let topics = parse_topics(&doc).unwrap_or_default();
+
+    doc.insert("hash".into(), Value::String(tx_hash));
+    doc.insert("blockNumber".into(), Value::Number(block_number.into()));
+    doc.insert("from".into(), Value::String(from));
+    doc.insert("to".into(), Value::String(to));
+    doc.insert("logAddress".into(), Value::String(log_address));
+
     if topics.is_empty() {
-        return ok_json(&doc);
-    }
-
-    let abi = parse_abi()?;
-
-    doc.insert("hash".into(), Value::String(tx_hash.clone()));
-    doc.insert("block".into(), Value::String(block_number.clone()));
-
-    if let std::option::Option::Some(event) = find_matching_event(&abi, &topics[0]) {
-        decode_event(&mut doc, &event, &topics)?;
+        doc.insert("event".into(), Value::String("Unknown".to_string()));
+        doc.insert("signature".into(), Value::String(String::new()));
+        doc.insert("arguments".into(), Value::String("[]".to_string()));
+    } else {
+        let abi = parse_abi().unwrap_or_default();
+        match find_matching_event(&abi, &topics[0]) {
+            std::option::Option::Some(event) => decode_event(&mut doc, event, &topics)?,
+            std::option::Option::None => {
+                doc.insert("event".into(), Value::String("Unknown".to_string()));
+                doc.insert("signature".into(), Value::String(String::new()));
+                doc.insert("arguments".into(), Value::String("[]".to_string()));
+            }
+        }
     }
 
     ok_json(&doc)
@@ -210,7 +236,8 @@ fn decode_event(
         }
     }
 
-    doc.insert("arguments".into(), Value::Array(arguments));
+    let args_str = serde_json::to_string(&arguments).unwrap_or_default();
+    doc.insert("arguments".into(), Value::String(args_str));
     Ok(())
 }
 
@@ -234,6 +261,13 @@ fn decode_param(typ: &str, hex_data: &str) -> String {
 }
 
 fn str_field(doc: &HashMap<String, Value>, key: &str) -> String {
+    doc.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn str_field_map(doc: &serde_json::Map<String, Value>, key: &str) -> String {
     doc.get(key)
         .and_then(|v| v.as_str())
         .unwrap_or_default()
