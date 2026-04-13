@@ -5,6 +5,7 @@ edition = "2018"
 
 [lib]
 crate-type = ["cdylib"]
+path = "decode_log_str.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -12,3 +13,5 @@ serde_json = "1.0"
 lens_sdk = "^0.7.0"
 hex = "0.4.3"
 sha3 = "0.10.8"
+num-bigint = "0.4"
+num-traits = "0.2"
