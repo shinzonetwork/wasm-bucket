@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha3::{Digest, Keccak256};
 
 #[link(wasm_import_module = "lens")]
-extern "C" {
+unsafe extern "C" {
     fn next() -> *mut u8;
 }
 
@@ -40,12 +40,12 @@ fn get_params() -> Result<Parameters, Box<dyn error::Error>> {
     Ok(params)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn alloc(size: usize) -> *mut u8 {
     lens_sdk::alloc(size)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn set_param(ptr: *mut u8) -> *mut u8 {
     match try_set_param(ptr) {
         Ok(_) => lens_sdk::nil_ptr(),
@@ -54,7 +54,7 @@ pub extern "C" fn set_param(ptr: *mut u8) -> *mut u8 {
 }
 
 fn try_set_param(ptr: *mut u8) -> Result<(), Box<dyn error::Error>> {
-    let parameter = lens_sdk::try_from_mem::<Parameters>(ptr)?.ok_or(ParametersNotSet)?;
+    let parameter = unsafe { lens_sdk::try_from_mem::<Parameters>(ptr)? }.ok_or(ParametersNotSet)?;
     *PARAMETERS.write()? = Some(parameter);
     Ok(())
 }
@@ -73,7 +73,7 @@ fn safe_to_mem(type_id: i8, data: &[u8]) -> *mut u8 {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn transform() -> *mut u8 {
     match try_transform() {
         Ok(Some(json)) => safe_to_mem(lens_sdk::JSON_TYPE_ID, &json),
@@ -85,7 +85,7 @@ pub extern "C" fn transform() -> *mut u8 {
 
 fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {
     let ptr = unsafe { next() };
-    let mut doc = match lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? {
+    let mut doc = match unsafe { lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? } {
         Some(v) => v,
         None => return ok_json(&HashMap::new()),
         EndOfStream => return Ok(EndOfStream),
