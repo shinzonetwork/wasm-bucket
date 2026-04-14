@@ -13,7 +13,7 @@ use serde_json::Value;
 use sha3::{Digest, Keccak256};
 
 #[link(wasm_import_module = "lens")]
-extern "C" {
+unsafe extern "C" {
     fn next() -> *mut u8;
 }
 
@@ -40,12 +40,12 @@ fn get_params() -> Result<Parameters, Box<dyn error::Error>> {
     Ok(params)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn alloc(size: usize) -> *mut u8 {
     lens_sdk::alloc(size)
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn set_param(ptr: *mut u8) -> *mut u8 {
     match try_set_param(ptr) {
         Ok(_) => lens_sdk::nil_ptr(),
@@ -54,7 +54,7 @@ pub extern "C" fn set_param(ptr: *mut u8) -> *mut u8 {
 }
 
 fn try_set_param(ptr: *mut u8) -> Result<(), Box<dyn error::Error>> {
-    let parameter = lens_sdk::try_from_mem::<Parameters>(ptr)?.ok_or(ParametersNotSet)?;
+    let parameter = unsafe { lens_sdk::try_from_mem::<Parameters>(ptr)? }.ok_or(ParametersNotSet)?;
     *PARAMETERS.write()? = Some(parameter);
     Ok(())
 }
@@ -73,7 +73,7 @@ fn safe_to_mem(type_id: i8, data: &[u8]) -> *mut u8 {
     ptr
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn transform() -> *mut u8 {
     match try_transform() {
         Ok(Some(json)) => safe_to_mem(lens_sdk::JSON_TYPE_ID, &json),
@@ -85,7 +85,7 @@ pub extern "C" fn transform() -> *mut u8 {
 
 fn try_transform() -> Result<StreamOption<Vec<u8>>, Box<dyn error::Error>> {
     let ptr = unsafe { next() };
-    let mut doc = match lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? {
+    let mut doc = match unsafe { lens_sdk::try_from_mem::<HashMap<String, Value>>(ptr)? } {
         Some(v) => v,
         None => return ok_json(&HashMap::new()),
         EndOfStream => return Ok(EndOfStream),
@@ -209,8 +209,9 @@ fn decode_event(
             }
             topic_idx += 1;
         } else {
+            // Non-indexed params are decoded from the data section below.
+            // Do NOT advance topic_idx here.
             non_indexed.push(inp);
-            topic_idx += 1;
         }
     }
 
@@ -241,12 +242,17 @@ fn decode_event(
     Ok(())
 }
 
+/// decode_param decodes a single ABI-encoded parameter from a 32-byte hex word.
+/// Supports all standard Solidity types used in events (uintN, intN, address,
+/// bool, bytesN). See decode_log/decode_log.rs for full documentation.
 fn decode_param(typ: &str, hex_data: &str) -> String {
     let clean = hex_data.trim_start_matches("0x");
+    let raw_bytes = hex::decode(clean).unwrap_or_default();
+    if raw_bytes.is_empty() {
+        return String::new();
+    }
+
     match typ {
-        "uint256" => u128::from_str_radix(clean, 16)
-            .map(|v| v.to_string())
-            .unwrap_or_else(|_| "0".to_string()),
         "address" => {
             if clean.len() >= 40 {
                 format!("0x{}", &clean[clean.len() - 40..])
@@ -254,10 +260,89 @@ fn decode_param(typ: &str, hex_data: &str) -> String {
                 format!("0x{}", clean)
             }
         }
-        "bool" => clean.ends_with('1').to_string(),
-        "bytes32" => format!("0x{}", clean),
-        _ => format!("unsupported type: {}", typ),
+        "bool" => raw_bytes.iter().any(|&b| b != 0).to_string(),
+        "string" | "bytes" => format!("0x{}", clean),
+        _ => {
+            if let std::option::Option::Some(bits) = parse_uint_bits(typ) {
+                decode_uint(&raw_bytes, bits)
+            } else if let std::option::Option::Some(bits) = parse_int_bits(typ) {
+                decode_int(&raw_bytes, bits)
+            } else if let std::option::Option::Some(n) = parse_bytes_n(typ) {
+                decode_bytes_n(&raw_bytes, n)
+            } else {
+                format!("unsupported type: {}", typ)
+            }
+        }
     }
+}
+
+fn parse_uint_bits(typ: &str) -> std::option::Option<usize> {
+    let suffix = typ.strip_prefix("uint")?;
+    let bits: usize = suffix.parse().ok()?;
+    if bits >= 8 && bits <= 256 && bits % 8 == 0 {
+        std::option::Option::Some(bits)
+    } else {
+        std::option::Option::None
+    }
+}
+
+fn parse_int_bits(typ: &str) -> std::option::Option<usize> {
+    let suffix = typ.strip_prefix("int")?;
+    if suffix.is_empty() {
+        return std::option::Option::None;
+    }
+    let bits: usize = suffix.parse().ok()?;
+    if bits >= 8 && bits <= 256 && bits % 8 == 0 {
+        std::option::Option::Some(bits)
+    } else {
+        std::option::Option::None
+    }
+}
+
+fn parse_bytes_n(typ: &str) -> std::option::Option<usize> {
+    let suffix = typ.strip_prefix("bytes")?;
+    if suffix.is_empty() {
+        return std::option::Option::None;
+    }
+    let n: usize = suffix.parse().ok()?;
+    if n >= 1 && n <= 32 {
+        std::option::Option::Some(n)
+    } else {
+        std::option::Option::None
+    }
+}
+
+fn decode_uint(raw: &[u8], _bits: usize) -> String {
+    use num_bigint::BigUint;
+    BigUint::from_bytes_be(raw).to_str_radix(10)
+}
+
+fn decode_int(raw: &[u8], bits: usize) -> String {
+    use num_bigint::{BigInt, Sign};
+    if raw.len() != 32 {
+        return "0".to_string();
+    }
+    let byte_width = bits / 8;
+    let start = 32 - byte_width;
+    let value_bytes = &raw[start..];
+    let is_negative = value_bytes[0] & 0x80 != 0;
+    if is_negative {
+        let mut complement = value_bytes.to_vec();
+        for b in complement.iter_mut() {
+            *b = !*b;
+        }
+        let positive = BigInt::from_bytes_be(Sign::Plus, &complement);
+        (-(positive + BigInt::from(1))).to_str_radix(10)
+    } else {
+        BigInt::from_bytes_be(Sign::Plus, value_bytes).to_str_radix(10)
+    }
+}
+
+fn decode_bytes_n(raw: &[u8], n: usize) -> String {
+    if raw.len() < n {
+        return format!("0x{}", hex::encode(raw));
+    }
+    format!("0x{}", hex::encode(&raw[..n]))
 }
 
 fn str_field(doc: &HashMap<String, Value>, key: &str) -> String {
