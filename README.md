@@ -41,10 +41,14 @@ indexer DefraDB  --P2P-->  host receives primitive document
 ```
 wasm-bucket/
 ├── bucket/
+│   ├── filter/
+│   │   ├── Cargo.toml
+│   │   ├── filter.rs
+│   │   └── filter.wasm               (committed build artifact, ~182 KB)
 │   ├── decode_log/
 │   │   ├── Cargo.toml
 │   │   ├── decode_log.rs
-│   │   └── decode_log.wasm           (committed build artifact, ~298 KB)
+│   │   └── decode_log.wasm           (committed build artifact, ~294 KB)
 │   ├── decode_log_str/               (same pattern, arguments as JSON string)
 │   ├── decode_function_call/
 │   └── decode_function_call_str/
@@ -93,16 +97,64 @@ Parameters set via `set_param` are deserialized with serde and stored in a `stat
 
 ## The current lenses
 
-| Lens | Purpose | `arguments` field shape | Tests |
+| Lens | Purpose | Output shape | Tests |
 |---|---|---|---|
-| `decode_log` | ABI-decode Ethereum event logs | JSON array | 17 passing |
-| `decode_log_str` | Same as above, arguments serialized as JSON string | JSON string | shares decoder with `decode_log` |
-| `decode_function_call` | ABI-decode Ethereum transaction `input` data | JSON array | 8 passing |
-| `decode_function_call_str` | Decodes function call + nested events, both with string `arguments` | JSON string | shares decoder with `decode_function_call` |
+| `filter` | Pass through documents whose top-level string field equals a target value; drop the rest | Input unchanged (on match) or nil (on drop) | 9 passing |
+| `decode_log` | ABI-decode Ethereum event logs | JSON document with `arguments` array | 17 passing |
+| `decode_log_str` | Same as above, arguments serialized as JSON string | JSON document with `arguments` as string | shares decoder with `decode_log` |
+| `decode_function_call` | ABI-decode Ethereum transaction `input` data | JSON document with `arguments` array | 8 passing |
+| `decode_function_call_str` | Decodes function call + nested events, both with string `arguments` | JSON document with stringified arguments | shares decoder with `decode_function_call` |
 
-All four crates are on `edition = "2024"` and `lens_sdk = "^0.8.1"` (the latest published version on crates.io as of August 2025), and share the same decoder helpers (`parse_uint_bits`, `parse_int_bits`, `parse_bytes_n`, `decode_uint`, `decode_int`, `decode_bytes_n`).
+All five crates are on `edition = "2024"` and `lens_sdk = "^0.8.1"` (the latest published version on crates.io as of August 2025). The four `decode_*` crates additionally share decoder helpers (`parse_uint_bits`, `parse_int_bits`, `parse_bytes_n`, `decode_uint`, `decode_int`, `decode_bytes_n`); `filter` has no decoder dependency and therefore ships a smaller wasm (~180 KB vs ~300 KB).
 
 The `_str` variants exist because DefraDB's `_like` / `_ilike` GraphQL filters operate on scalar strings, not on nested array fields. Serializing `arguments` as an opaque JSON string lets you filter view documents by substring matching on the encoded arguments (for example, finding every Transfer that mentions a particular address) without the host having to split each argument into its own collection.
+
+### filter
+
+**Parameters:**
+
+| Field | Type | Description |
+|---|---|---|
+| `src` | String | Name of the top-level field to read from each input document |
+| `value` | String | Expected value, compared case-insensitively (ASCII) |
+
+**Input:** any JSON object with a top-level string field named by `src`.
+
+**Output:**
+
+- On match: the input document unchanged (re-serialized from the same in-memory shape; no field ordering guarantee beyond what the JSON serializer produces).
+- On mismatch (including missing field, non-string field, null): `NIL_TYPE_ID`. Downstream lenses see nothing for this iteration, and the host skips it the same way it handles an empty source yield.
+
+**Typical usage** in a view's lens chain (from `shinzo-app`'s codegen output):
+
+```json
+{
+  "lenses": [
+    {
+      "label": "filter_by_address",
+      "source": "wasm-bucket/filter/filter.wasm",
+      "args": {"src": "address", "value": "0x000000000004444c5dc75cB358380D2e3dE08A90"}
+    },
+    {
+      "label": "decode_log_str",
+      "source": "wasm-bucket/decode_log_str/decode_log_str.wasm",
+      "args": {"abi": "[...]"}
+    }
+  ]
+}
+```
+
+Without the filter, `decode_log_str` would receive every `Log` document on the chain and decode every signature that happens to match one of the events in the provided ABI — which means every ERC20 `Transfer` emitted by any contract (they all share `topics[0] = 0xddf252ad...`) would land in the view's output collection regardless of which contract emitted it.
+
+**What this lens does NOT do:**
+
+- No regex / glob / prefix matching. Exact (case-insensitive) equality only.
+- No inequality, membership (`in`), or multi-value compare. Each would be a separate lens crate, not a parameter on this one.
+- No nested field access (`transaction.from`). Top-level only.
+
+These are deliberate scope decisions; keeping the contract narrow makes the lens trivially correct. Add a new crate when one of these is actually needed.
+
+**Why case-insensitive compare.** Ethereum addresses are commonly pasted into `config.yaml` in EIP-55 checksummed form (mixed case), while indexers normalize to lowercase when storing `Log` documents. Case-insensitive match bridges the two without forcing config authors to hand-lowercase their addresses. Fields that ARE case-sensitive (IPFS CIDs, signed message hashes) should not be filtered by this lens today; add a case-sensitive variant if that use case materializes.
 
 ### decode_log and decode_log_str
 
